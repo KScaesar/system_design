@@ -15,13 +15,15 @@
 5. 兩個 worker 會不會同時推進同一筆？（lease 不夠，要 fencing token）
 6. 這狀態值 crash 後**能不能重算**？能重算就不用存
 
-**三層狀態（依賴方向單向向下，不可混放同一張表）：**
+**三層（依賴方向單向向下，不可混放同一張表）：**
 
 | 層 | 回答什麼問題 | 典型值 | 誰能讀 |
 |---|---|---|---|
 | **Business State** | 商業上現在是什麼？ | `CREATED / PAID / SHIPPED` | API、UI、報表 |
 | **Integration State** | 每個跨系統邊界做到哪？ | `IN_FLIGHT → UNKNOWN → SUCCEEDED / FAILED → COMPENSATED` | workflow 內部 |
-| **Recovery State** | crash 後怎麼恢復？ | `retry_count / next_retry_at / deadline / lease` | 只有 recovery 邏輯 |
+| **Recovery Status** | crash 後怎麼恢復？ | `retry_count / next_retry_at / deadline / lease_expire` | 只有 recovery 邏輯 |
+
+**IN_FLIGHT ≠ IN_PROGRESS / RUNNING**：三者字面上都像「還在跑」，但 IN_FLIGHT 專指「已送出、結果未知」——它的唯一理由是 Two Generals 造成的不確定性，所以才需要 timeout 把它升格成 UNKNOWN。IN_PROGRESS / RUNNING 是泛用的「目前正在執行」，不隱含結果不可知，通常用在本地、確定性的執行，例如 `exec_state` 的 `RUNNING`（整個 workflow run 還在跑，不是某一次外部呼叫卡在不確定期）。粒度不同：`RUNNING` 是 workflow 整體，`IN_FLIGHT` 是單次跨系統呼叫。
 
 **每個 integration boundary 的固定生命週期（背這張圖就夠）：**
 
@@ -291,15 +293,15 @@ workflow_instance
 
 到目前為止，我們被迫累積了這些東西：
 
-- 業務狀態：`status = PAID`
-- 執行狀態：`step`、`phase`、`idem_key`、`result`
+- 業務狀態：`state = PAID`
+- 執行狀態：`step`、`state`、`idem_key`、`result`
 - 復原資訊：`retry_count`、`last_error`、`next_retry_at`、`deadline`、`lease`
 
 如果全塞進 `orders`，腐化路徑是可預測的。先是：
 
 ```text
 orders
-  status
+  state
   payment_sent
   mq_sent
   retry_count
@@ -310,7 +312,7 @@ orders
 
 ```text
 orders
-  status
+  state
   payment_sent
   payment_retry
   mq_sent
@@ -319,12 +321,12 @@ orders
   shipping_retry
 ```
 
-Domain model 被執行細節汙染，status enum 無限膨脹，報表看不懂，換 orchestrator 要動 domain schema。
+Domain model 被執行細節汙染，state enum 無限膨脹，報表看不懂，換 orchestrator 要動 domain schema。
 
 > **推論 7：三類狀態回答三個不同的問題，必須分層，而且依賴方向單向向下。**
 
 ```text
-Recovery State      retry_count / next_retry_at / deadline / last_error
+Recovery Status      retry_count / next_retry_at / deadline / last_error
         │
         │  驅動（誰該被喚醒、還能重試幾次）
         v
@@ -335,9 +337,9 @@ Integration State   IN_FLIGHT → UNKNOWN → SUCCEEDED / FAILED → COMPENSATED
 Business State      CREATED → PAID → SHIPPED
 ```
 
-- **Business State**——商業上目前是什麼狀態？通常很少，三五個就夠。給 API、UI、報表、稽核用。注意 `PAID` 只代表商業上已付款，不代表 MQ 已送出、consumer 已收到、所有 side effect 完成。
+- **Business State**——商業上目前是什麼狀態？通常很少，三五個就夠。給 API、UI、報表、稽核用。注意 `PAID` 只代表商業上已付款，不代表 MQ 已送出、consumer 已收到、所有 side effect 完成。這是真正的 `state`：互斥、有轉移規則、決定下一步合法動作。
 - **Integration State**——每個跨系統 action 做到哪？這不是業務狀態，是**系統整合狀態**。
-- **Recovery State**——crash 後怎麼恢復？純粹為復原而存在，業務永遠不該讀它。
+- **Recovery Status**——crash 後怎麼恢復？純粹為復原而存在，業務永遠不該讀它。
 
 兩條必須守住的規則：
 
@@ -426,7 +428,7 @@ Business State      CREATED → PAID → SHIPPED
 - timer 驅動喚醒（第 5 步）
 - 單一 owner 推進（第 7 步）
 
-這就是 Temporal 的 event history。**Durable Execution engine 幫你託管的，正是 Integration State 與 Recovery State 這兩層**，讓你的程式碼只需要寫 happy path。
+這就是 Temporal 的 event history。**Durable Execution engine 幫你託管的，正是 Integration State 與 Recovery Status 這兩層**，讓你的程式碼只需要寫 happy path。
 
 而這也解釋了它那條看似奇怪的限制——**workflow 程式碼必須 deterministic，side effect 必須包成 activity**：
 
@@ -476,7 +478,7 @@ Schema 骨架，三層分開：
 -- Business State：領域事實，長期保存
 CREATE TABLE orders (
   order_id    BIGINT PRIMARY KEY,
-  status      VARCHAR(32) NOT NULL,   -- 僅業務語意: CREATED/PAID/SHIPPED/CANCELLED
+  state       VARCHAR(32) NOT NULL,   -- 僅業務語意: CREATED/PAID/SHIPPED/CANCELLED
   amount      DECIMAL(18,4) NOT NULL,
   updated_at  TIMESTAMP NOT NULL      -- 存 UTC
 );
@@ -486,14 +488,14 @@ CREATE TABLE integration_action (
   run_id      CHAR(36)     NOT NULL,
   step_name   VARCHAR(64)  NOT NULL,
   boundary    VARCHAR(32)  NOT NULL,  -- payment / inventory / mq ...
-  phase       VARCHAR(24)  NOT NULL,  -- IN_FLIGHT/UNKNOWN/SUCCEEDED/FAILED/COMPENSATED
+  state       VARCHAR(24)  NOT NULL,  -- IN_FLIGHT/UNKNOWN/SUCCEEDED/FAILED/COMPENSATED
   idem_key    VARCHAR(128) NOT NULL,
   result      JSON,                   -- 外部回傳的不可重算值
   PRIMARY KEY (run_id, step_name),
   UNIQUE KEY uk_idem (idem_key)
 );
 
--- Recovery State：純粹為復原而存在
+-- Recovery Status：純粹為復原而存在
 CREATE TABLE action_recovery (
   run_id        CHAR(36)    NOT NULL,
   step_name     VARCHAR(64) NOT NULL,
@@ -537,23 +539,23 @@ CREATE TABLE reservations (
 Go 這一段是第 3 步那條推論的直接落地——把「什麼算 FAILED」寫死，不讓它變成每個 caller 各自判斷：
 
 ```go
-type Phase string
+type IntegrationState string
 
 const (
-    InFlight    Phase = "IN_FLIGHT"
-    Unknown     Phase = "UNKNOWN"
-    Succeeded   Phase = "SUCCEEDED"
-    Failed      Phase = "FAILED"       // 僅限對方明確拒絕
-    Compensated Phase = "COMPENSATED"
+    InFlight    IntegrationState = "IN_FLIGHT"
+    Unknown     IntegrationState = "UNKNOWN"
+    Succeeded   IntegrationState = "SUCCEEDED"
+    Failed      IntegrationState = "FAILED"       // 僅限對方明確拒絕
+    Compensated IntegrationState = "COMPENSATED"
 )
 
-var transitions = map[Phase][]Phase{
+var transitions = map[IntegrationState][]IntegrationState{
     InFlight: {Unknown, Succeeded, Failed},
     Unknown:  {Succeeded, Failed, Compensated}, // 解消後才離開
     Failed:   {Compensated},
 }
 
-func classify(err error, resp *Response) Phase {
+func classify(err error, resp *Response) IntegrationState {
     switch {
     case err != nil:
         return Unknown                  // timeout / conn reset 一律 unknown
@@ -606,7 +608,7 @@ func classify(err error, resp *Response) Phase {
 
 ### 16. 換成 Temporal 之後，哪些狀態不用自己定義
 
-第 12 步說過：Temporal 這類 durable execution engine 代管的正是 Integration State 與 Recovery State 兩層。但「代管」不等於「消失」——只是換了地方存、換了人寫。把第 14 步的四張表拿出來逐一核對：
+第 12 步說過：Temporal 這類 durable execution engine 代管的正是 Integration State 與 Recovery Status 兩層。但「代管」不等於「消失」——只是換了地方存、換了人寫。把第 14 步的四張表拿出來逐一核對：
 
 **Temporal 真的省下來的部分：**
 
@@ -627,7 +629,7 @@ func classify(err error, resp *Response) Phase {
 
 一句話收攏（換成 Temporal 官方術語會更精確）：
 
-> Temporal 自動代管的是 Activity 的 **execution bookkeeping**——也就是每次呼叫的 `Scheduled → Started → Completed / Failed / TimedOut` 這條 **state machine**，全部自動寫進 **Event History**，這對應到 Recovery State 整層，加上 Integration State 裡「這次呼叫進行到哪一步」的部分。
+> Temporal 自動代管的是 Activity 的 **execution bookkeeping**——也就是每次呼叫的 `Scheduled → Started → Completed / Failed / TimedOut` 這條 **state machine**，全部自動寫進 **Event History**，這對應到 Recovery Status 整層，加上 Integration State 裡「這次呼叫進行到哪一步」的部分。
 >
 > 但 Temporal **不會**替你做 domain-level 的判斷：呼叫的**回傳結果該解讀成什麼**（UNKNOWN 還是 FAILED）、以及**收斂它的手段**（query API / idempotent replay / compensation），這些邏輯要你自己寫在 Activity function 內部，用 `NonRetryableApplicationError` 顯式標記 FAILED，其餘一律讓 `RetryPolicy` 自動重試（= UNKNOWN 的行為）。
 
@@ -637,11 +639,11 @@ func classify(err error, resp *Response) Phase {
 
 | 欄位 | 换成 Temporal 之後 |
 |---|---|
-| `phase`（IN_FLIGHT/UNKNOWN/…） | **可以刪**。Activity 的 `Scheduled/Started/Completed/Failed/TimedOut` 已經是 Event History 裡現成的 state machine，不用自己再維護一份同語意的欄位。 |
+| `state`（IN_FLIGHT/UNKNOWN/…） | **可以刪**。Activity 的 `Scheduled/Started/Completed/Failed/TimedOut` 已經是 Event History 裡現成的 state machine，不用自己再維護一份同語意的欄位。 |
 | `idem_key` | **可以不存**，只要它是 `hash(run_id, step_name)` 這種可重算值（第 4 步已強調要穩定可重算），每次呼叫時算出來即可，不需要落地。 |
 | `result` | **不能刪，但要換位置**。這是外部系統回傳的不可重算值（交易編號、回應 payload），第 14 步的判準是「crash 後能不能重算」——不能重算就要存。Temporal 會把它寫進 `ActivityTaskCompleted` 事件的 payload，但那份紀錄有 retention、查詢要走 `GetWorkflowHistory`，不是一張能直接 `SELECT` 的表。 |
 
-保留的理由是第 8 步那條規則的延伸——**投影必須真的落地**：如果查「這筆付款的外部交易編號是多少」要去翻 workflow history，retention 一過就查不到了，engine 出問題等於這筆事實不可觀測。所以實務上留一張瘦身版、拿掉 `phase` 的表，角色從「recovery 邏輯查表決定下一步」降級成「對帳 / 稽核用的唯讀投影」：
+保留的理由是第 8 步那條規則的延伸——**投影必須真的落地**：如果查「這筆付款的外部交易編號是多少」要去翻 workflow history，retention 一過就查不到了，engine 出問題等於這筆事實不可觀測。所以實務上留一張瘦身版、拿掉 `state` 欄位的表，角色從「recovery 邏輯查表決定下一步」降級成「對帳 / 稽核用的唯讀投影」：
 
 ```sql
 CREATE TABLE integration_action_result (
@@ -671,4 +673,4 @@ CREATE TABLE integration_action_result (
 
 一句話收攏：**`workflow_instance` 的四組欄位，Temporal 都有原生機制頂替，唯一該留下來的只有「run_id 對照」，而它的正確位置是 Business State 表的一個欄位，不是獨立表。**
 
-落到第 14 步的 schema 上：`action_recovery` 可以整張刪；`integration_action` 可以簡化成只存 `idem_key` 與 `result`（phase 轉移已經在 event history 裡，不必重複記錄）；`orders`（Business State）與 Activity 內的錯誤分類 / unknown resolver 邏輯,則不論用不用 Temporal 都要留著。
+落到第 14 步的 schema 上：`action_recovery` 可以整張刪；`integration_action` 可以簡化成只存 `idem_key` 與 `result`（`state` 轉移已經在 event history 裡，不必重複記錄）；`orders`（Business State）與 Activity 內的錯誤分類 / unknown resolver 邏輯,則不論用不用 Temporal 都要留著。

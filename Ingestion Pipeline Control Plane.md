@@ -35,7 +35,7 @@ Message Queue -> Consumer -> Buffer -> Object Storage
 Consumer -> Metadata Store -> Batch Metadata
 ```
 
-保存：Batch 資訊、Source position、Object mapping、Processing status。
+保存：Batch 資訊、Source position、Object mapping、Batch state。
 
 ---
 
@@ -95,7 +95,7 @@ CREATE TABLE batch_catalog (
     writer_schema_id VARCHAR,  -- 寫入當下使用的 Avro Writer Schema（Schema Registry 版本號或 fingerprint）
     object_path     VARCHAR,
     checksum        VARCHAR,
-    status          VARCHAR,
+    state           VARCHAR,
     created_at      TIMESTAMP,
     completed_at    TIMESTAMP
 );
@@ -116,12 +116,12 @@ CREATE TABLE batch_catalog (
 
 ```
 Message Queue -> Consumer Buffer -> Create Batch Metadata
-  -> Write Object Storage -> Update Batch Status -> Commit Message Offset
+  -> Write Object Storage -> Update Batch State -> Commit Message Offset
 ```
 
 Commit Message Offset 必須在 Object write 成功、Metadata update 成功之後執行。
 
-`Commit Message Offset` 是 best-effort 步驟：它只是為了讓 MQ 下次能從接近的位置開始讀取，藉此縮短重複讀取的範圍。它是否成功，不影響 Batch 是否視為完成——這由 Batch Status 決定。
+`Commit Message Offset` 是 best-effort 步驟：它只是為了讓 MQ 下次能從接近的位置開始讀取，藉此縮短重複讀取的範圍。它是否成功，不影響 Batch 是否視為完成——這由 Batch State 決定。
 
 ---
 
@@ -133,7 +133,7 @@ Consumer 啟動或重啟時，不採用 MQ 自身記錄的 committed offset 作�
 SELECT MAX(offset_end)
 FROM batch_catalog
 WHERE partition_id = :partition_id
-  AND status = 'COMMITTED'
+  AND state = 'COMMITTED'
 ```
 
 並從 `offset_end + 1` 開始讀取。
@@ -152,15 +152,15 @@ WHERE partition_id = :partition_id
 
 ## Object Write 前失敗
 
-狀態：`Batch Status: CREATED`
+狀態：`Batch State: CREATED`
 
-Recovery：找出未完成 Batch → 重新寫入 Object → 更新 Batch Status。
+Recovery：找出未完成 Batch → 重新寫入 Object → 更新 Batch State。
 
 ## Object Write 後失敗
 
-狀態：`Object exists`、`Batch Status: WRITING`
+狀態：`Object exists`、`Batch State: WRITING`
 
-Recovery：檢查 Object Metadata → 驗證 checksum → 更新 Batch Status。
+Recovery：檢查 Object Metadata → 驗證 checksum → 更新 Batch State。
 
 ## 重複讀取相同 Offset 範圍
 
@@ -179,7 +179,7 @@ Recovery：Create Batch Metadata 前，先以 `partition_id + offset_start` 查�
 Metadata Store -> 取得 Batch Boundary -> 讀取原始資料範圍 -> 產生相同 Object
 ```
 
-Replay 不依賴：Current time、Current buffer size、Current flush condition。
+Replay 不依賴：Current time、Current buffer size、Current flush guard。
 
 ---
 
@@ -198,7 +198,7 @@ Original Object、New Object 因此分別對應兩筆 row 各自的 `object_path
 ```sql
 SELECT b.*
 FROM batch_catalog b
-WHERE b.status = 'COMMITTED'
+WHERE b.state = 'COMMITTED'
   AND NOT EXISTS (
     SELECT 1 FROM batch_catalog s WHERE s.source_batch_id = b.batch_id
   )
