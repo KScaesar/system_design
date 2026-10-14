@@ -303,6 +303,137 @@ Message -> Batch -> Object -> Dataset
 
 ---
 
+# 與 Durable Execution 的關係
+
+參考：[Durable execution with Apache Airflow（Astronomer）](https://www.astronomer.io/blog/durable-execution-with-apache-airflow/)
+
+本節先整理文章的內容，再說明它與本文設計的對應。
+
+## Durable Execution 是什麼
+
+執行程式的 process 中途掛掉後，可以由另一個 process 接手，從「最後一次記錄的結果」繼續，而不是從頭開始。文章指出這不只是「crash proof execution」（Temporal 的說法），各家實作的做法不同：
+
+- Temporal：重播 orchestration code。
+- Restate、DBOS：checkpoint 每個 step。
+- AWS Step Functions：宣告式的 state machine。
+- Airflow：在 task 內明確記錄 checkpoint。
+
+**核心限制：Durable Execution 是 at-least-once，不是 exactly-once。** 提交 job、付款這類 side effect 仍需要冪等，做法是 idempotency key、穩定的 job ID 或 status check。
+
+## Airflow 3.3 的做法
+
+3.3 之前，Airflow 只在 task 之間是 durable：清除失敗的 run，會從失敗的 task 繼續。但執行 task 的 worker 若在 task 執行到一半時掛掉，retry 會把整個 task 從頭重跑。3.3 把 durability 推進到 task 內部。
+
+文章把 task 分成**兩種形態**：
+
+> what follows comes in two shapes rather than one. Operators that already know how to reconnect to the specific system they talk to, and a plain API for when the long-running thing is your own code.
+
+### 形態 1：把工作交給外部系統的 task
+
+文章的前提是：Airflow 的 task 通常不做實際的工作，而是提交 Spark job、啟動 pod、對 warehouse 執行 query。
+
+**要解決的情境**：Airflow 的 worker（執行這個 task 的 process）把一個需要兩小時的 job 提交到 Spark 叢集後，正在等待 job 完成時，worker 自己掛掉。Spark 叢集是獨立的系統，不受影響，job 仍在叢集上繼續執行，但已經沒有任何 process 在等它。
+
+兩個版本的前半段相同：worker 向 Spark 叢集提交 job，叢集回傳一個 job id（例如 `job-A`）。差別在於這個 `job-A` 有沒有被存到 worker 以外的地方。
+
+| 步驟 | 3.3 之前 | 3.3 之後 |
+|---|---|---|
+| 1. 提交 job | worker 1 提交，拿到 `job-A` | worker 1 提交，拿到 `job-A` |
+| 2. 開始等待之前 | `job-A` 只存在 worker 1 的記憶體 | operator 把 `job-A` 寫進 task state store（存在 Airflow 的 metadata database） |
+| 3. worker 1 掛掉 | `job-A` 跟著消失，Spark 上的 `job-A` 仍在執行 | 記憶體裡的 `job-A` 消失，但 task state store 裡仍有 |
+| 4. Airflow 用 worker 2 重跑（retry） | worker 2 沒有任何紀錄，只能重新提交，產生 `job-B` | worker 2 先讀 task state store，讀到 `job-A`，不重新提交 |
+| 5. 結果 | `job-A` 和 `job-B` 同時寫同一張表，要付兩份費用 | worker 2 向 Spark 叢集查詢 `job-A` 的狀態，再依下表處理 |
+
+3.3 之前若要避免重複，只能自己把工作拆成 submit task 和 wait task，讓 job id 存在 XCom 或 Variable。3.3 之後，operator 內建這個做法，不需要自己拆。
+
+worker 2 查詢 `job-A` 的狀態後，依結果分三種處理：
+
+| job 狀態 | retry 的行為 |
+|---|---|
+| 還在跑 | 重新接上（reattach），繼續 polling |
+| 已成功 | 跳過提交和 polling，直接回傳結果 |
+| 已失敗 | 重新提交 |
+
+各 operator 記錄的「身分」，就是之後能向外部系統找回這個 job 的識別資訊，依外部系統而不同。以兩個為例：
+
+| Operator | 記錄的內容 | retry 時怎麼接回 |
+|---|---|---|
+| `BigQueryInsertJobOperator` | BigQuery 的 job id | 用 job id 向 BigQuery 查詢該 job 的狀態 |
+| `KubernetesPodOperator` | pod name 和 namespace | 找到同一個 pod 接回，不再啟動新的 pod |
+
+其他 operator（Spark、Databricks、Snowflake、Redshift、Glue、Livy）也是同樣的做法，各自記錄該系統的 job id、run id 或 statement id。
+
+- **機制**：operator 內建，由 `durable` 控制，3.3 預設為 `True`（「For external jobs you opt out」）。
+- **限制**：只涵蓋同步路徑。`deferrable=True` 時由 Triggerer 追蹤 job，`durable` 不起作用。
+
+### 形態 2：自己在 process 內做工作的 task
+
+沒有 external job 可以 reattach，要靠記錄進度來恢復。文章再分兩個情況：
+
+- **自己的程式碼**：用 `task_state_store` 的 `get` 和 `set` 記錄 job id、batch offset、checkpoint 等，retry 時從最後記錄的位置繼續。例如記錄 batch offset，讓 retry 從 record 8,001 開始。
+- **AI agent**：`@task.agent` 或 `AgentOperator` 設定 `durable=True`，每個 model response 和 tool result 完成時就快取。retry 時重播已完成的步驟，只對未完成的步驟真的呼叫。stored fingerprint 會在 request 改變時丟棄過期的步驟。這是 opt-in（「For agents you opt in」），且需要設定 retries。
+
+### State 的儲存（AIP-103）
+
+| 種類 | 範圍 | 用途 |
+|---|---|---|
+| Task state store | 單一 task instance（dag_id、run_id、task_id、map_index），retry 之間存活，下一個 run 就沒有了 | 當次 attempt 的 in-flight 進度 |
+| Asset state store | 單一 asset，跨 run 存活，其他 DAG 可讀取 | watermark、offset |
+
+- XComs 在每次 retry 時會被清除，task state 則會保留。
+- 後端可替換，預設為 metadata database，較大的值可放 object storage。
+- 值必須能轉成 JSON。
+- Asset state 是「makes the next run cheaper rather than the current attempt survivable」，不屬於 crash recovery。
+
+### 文章的設計原則
+
+- **存指標，不存內容**：存 checkpoint 的 URI 和 epoch，不存 model weights。
+- **外部寫入完成後才記錄**：先記錄再寫入，會把寫到一半的檔案當成已完成的 checkpoint。
+- **優先用現成 operator**：submit 加 sensor 的拆法，submit task 綠燈只代表 API call 成功，不代表 job 完成。
+- **Durability 取決於目標系統**：Spark driver、pod、query 的 reattach 方式各不相同。
+- **State 用於 in-flight 的工作，不當作歷史紀錄**。
+
+## 對照本文的設計
+
+### 本文屬於哪一種形態
+
+- **Consumer 是形態 2**：自己在 process 內處理資料，沒有 external job，所以用 Metadata Store 記錄進度。這和 `task_state_store` 加 batch offset 是同一類做法，差別只在把 state 放在自己的 `batch_catalog`，不放在 Airflow。
+- **Object write 是形態 1 的縮影**：外部有 Object Storage，所以 `WRITING` 狀態搭配 checksum，先檢查外部是否已有結果，再決定接上或重做，對應 operator 的 reattach 三種分支。
+
+### 設計對應
+
+| 文章的原則或機制 | 本文的對應 | 章節 |
+|---|---|---|
+| 狀態外部化，process 換掉仍能接手 | Metadata Store 是 Source of Truth | Design Rules（Rule 4） |
+| 從最後一次記錄的結果繼續 | 查詢 `MAX(offset_end)`（`state = 'COMMITTED'`），從 `offset_end + 1` 開始讀取 | [Consumer Position 管理](#consumer-position-管理) |
+| 外部寫入完成後才記錄 | Object write 和 Metadata update 成功後，才 Commit Message Offset | [Ingestion Flow](#ingestion-flow) |
+| 存指標，不存內容 | `batch_catalog` 只存 `object_path`、`checksum`、offset 範圍 | [Metadata Store](#metadata-store) |
+| 重試時 reattach，依外部狀態分支 | 依 Batch State 決定 Recovery，並驗證 Object 的 checksum | [Failure Recovery](#failure-recovery) |
+| at-least-once 搭配冪等 | 以 `partition_id + offset_start` 去重 | [Failure Recovery](#failure-recovery) |
+| Asset state 存 watermark 和 offset | `batch_catalog` 中 `COMMITTED` 的 `offset_end` | [Consumer Position 管理](#consumer-position-管理) |
+| 外部系統的進度不當作真相 | MQ offset commit 只是 best-effort | Design Rules（Rule 5） |
+
+### Replay 與 Durable Execution 的重播是同一個概念
+
+文章中 AI agent 的重播，是把不確定的 model response 快取下來，retry 時沿用，不重新呼叫。本文的 Replay 是同一個模式：flush 的時機是不確定的決定，所以保存 Batch Boundary（offset 範圍與 `flush_reason`），Replay 時沿用，不重新決定（Rule 3）。
+
+剩下的差異只有三點：
+
+- **觸發原因**：文章的重播用於失敗後的 retry。本文的 Replay 也用於已成功之後的 Backfill 和 Reprocess，由人主動觸發。
+- **驗證精度**：本文要求產出的 Object 用 `checksum` 驗證 bit-for-bit 相同，所以連 `writer_schema_id` 也要保存。文章沒有討論到這個精度。
+- **保存期限**：本文的 `batch_catalog` 是長期的歷史紀錄，同時是 lineage、backfill 與 schema 的紀錄。文章建議 task state 不當作歷史紀錄。
+
+### 文章指出的縫隙，本文同樣存在
+
+文章承認：「A crash can always leave the durable execution system unsure whether the external call landed.」也就是 worker 在「已向外部系統提交 job」和「把 job id 記錄下來」這兩個動作之間掛掉，retry 的新 worker 找不到 id，仍可能重複提交。本文在 `CREATED` 到 `WRITING` 之間，Consumer 失敗的情況相同，靠 [Failure Recovery](#failure-recovery) 補上：檢查 Object 是否存在，並以 `checksum` 驗證。
+
+### 搭配 Airflow 時的注意事項
+
+- **分工不混用**：Airflow 的 task state store 管單次 attempt 的 in-flight 進度，`batch_catalog` 管跨 run 的永久 Source of Truth。Airflow 的 state store 不取代 Metadata Store。
+- **不能假設所有 operator 都有 durable**：以 `DbtCloudRunJobOperator` 為例，文章沒有提到它，provider changelog 也沒有 durable 或 reattach 的紀錄。[PR #72423](https://github.com/apache/airflow/pull/72423) 曾提出：Airflow worker 掛掉後，retry 重新接上 dbt Cloud 上仍在執行的 run。但該 PR 已 CLOSED，沒有 merge。所以同步模式下，Airflow worker 掛掉後，retry 的新 worker 仍可能向 dbt Cloud 再提交一個 run，需要自己處理冪等。Local dbt 的情況則查不到資料。
+
+---
+
 # Design Rules
 
 ## Rule 1
