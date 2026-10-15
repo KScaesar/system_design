@@ -311,14 +311,52 @@ Message -> Batch -> Object -> Dataset
 
 ## Durable Execution 是什麼
 
-執行程式的 process 中途掛掉後，可以由另一個 process 接手，從「最後一次記錄的結果」繼續，而不是從頭開始。文章指出這不只是「crash proof execution」（Temporal 的說法），各家實作的做法不同：
-
-- Temporal：重播 orchestration code。
-- Restate、DBOS：checkpoint 每個 step。
-- AWS Step Functions：宣告式的 state machine。
-- Airflow：在 task 內明確記錄 checkpoint。
+執行程式的 process 中途掛掉後，可以由另一個 process 接手，從「最後一次記錄的結果」繼續，而不是從頭開始。文章指出這不只是「crash proof execution」（Temporal 的說法）。
 
 **核心限制：Durable Execution 是 at-least-once，不是 exactly-once。** 提交 job、付款這類 side effect 仍需要冪等，做法是 idempotency key、穩定的 job ID 或 status check。
+
+## 邊界放在哪裡（Four places to put the boundary）
+
+> Durable execution is a promise about recovery, not a single implementation.
+
+各家系統的差別，主要在「進度在哪一個單位變成持久的」：整個 function、function 內一個命名的 step、state machine 的一個 state，或一次 task attempt。文章整理成四種：
+
+**1. 重播的 orchestration code**（Temporal、Azure Durable Functions）
+
+- 邊界：整個 orchestration function。
+- 恢復：重新執行 orchestration code，並從歷史紀錄餵回先前的結果。
+- 實作方式：每做完一件事，就把結果追加到一份 history。掛掉後從頭重跑 code，遇到 history 裡已有的結果就直接取用，不真的執行，直到追上最後一筆才開始執行新的工作。
+- 代價：orchestration code 必須是 deterministic，否則重跑時會走到和 history 對不上的路徑。
+
+**2. function 內有 checkpoint 的 step**（Restate、Inngest、DBOS、Cloudflare Workflows）
+
+- 邊界：function 內一個命名的 step。
+- 恢復：重新呼叫 function，已完成的 step 直接回傳存好的結果。
+- 實作方式：把每個有 side effect 的動作包成 step，並給它一個身分。執行前先查有沒有這個身分的結果，有就直接回傳，沒有才執行並存下結果。
+- 代價：side effect 要放進 step，step 的身分必須保持有效。
+
+**3. 宣告式 state machine**（AWS Step Functions）
+
+- 邊界：state machine 的一個 state。
+- 恢復：服務根據儲存的 state 往下推進，不重播你的程式碼。
+- 實作方式：用服務規定的語言宣告有哪些 state 與轉移條件，每個 state 的工作交給外部執行，由服務負責記錄目前在哪個 state。
+- 代價：控制流程受限於服務的 state machine 語言。
+
+**4. 明確的 task checkpoint**（Airflow）
+
+- 邊界：一次 task attempt。
+- 恢復：retry 讀取已存的 state，或重新接上已存的外部工作。
+- 實作方式：Airflow 3.3 有兩種寫法。
+  - 外部 job：operator 內建，`durable=True`（預設），operator 在等待前先記錄 job 的身分。
+  - 自己的程式碼：在 task 內呼叫 `task_state_store.set()` 記錄進度，retry 時用 `task_state_store.get()` 讀回來。
+- 代價：程式只能從「有記錄」的 state 繼續。
+
+上面第 1 到 3 種的「實作方式」，是我依文章對恢復方式的描述，整理出的概念示意，不是各產品的實際 API，文章沒有逐一說明它們的內部做法。第 4 種的寫法來自文章。
+
+文章補充兩點：
+
+- 這四種描述的是開發者看到的介面，不是四種獨立的實作。Checkpoint step 的系統同樣會重播 function，只是要你標出哪些較小的單位，其結果必須保留。
+- 四種都有同一個限制：「None of them can make an external side effect and its own state update a single atomic write」，除非外部系統加入同一個 transaction。所以不論選哪一種，idempotency key、穩定的 job ID 和 status check 都仍然需要。
 
 ## Airflow 3.3 的做法
 
@@ -394,6 +432,20 @@ worker 2 查詢 `job-A` 的狀態後，依結果分三種處理：
 - **State 用於 in-flight 的工作，不當作歷史紀錄**。
 
 ## 對照本文的設計
+
+### 本文把邊界放在哪裡
+
+回到「進度在哪一個單位變成持久的」這個問題：本文的答案是 **Batch**。一個 Batch 對應一個 Object，`batch_catalog` 的一筆 row 就是一個持久化的單位，記錄它的範圍（`offset_start`、`offset_end`）、產生條件（`flush_reason`）、使用的 schema（`writer_schema_id`）和狀態。
+
+以下是依文章的四種分類所做的判斷，不是文章本身的結論：
+
+- **第 4 種（明確的 task checkpoint）：最接近。** Consumer 的恢復完全依賴自己記錄的 state，沒有任何框架替它保存進度。實作方式是 Consumer 在 `batch_catalog` 寫入 Batch Metadata，重啟時查詢 `COMMITTED` 的最大 `offset_end`，從下一筆開始讀（[Consumer Position 管理](#consumer-position-管理)）。
+- **第 3 種（宣告式 state machine）：只有形狀相似。** `CREATED` → `WRITING` → `COMMITTED` / `FAILED` 是 state machine，但沒有服務替我們推進，每個狀態的 Recovery 邏輯（[Failure Recovery](#failure-recovery)）要自己寫。
+- **第 1、2 種（重播與 checkpoint step）：Replay 借用了它們的做法。** 把先前的結果（Batch Boundary）存下來，重播時沿用，不重新計算。實作方式是 Replay 讀取已保存的 `offset_start`、`offset_end`、`flush_reason` 和 `writer_schema_id`，不重新決定 flush，直接重新產生 Object。
+
+第 4 種的代價是「程式只能從有記錄的 state 繼續」，這直接解釋了 Rule 3：**沒有記錄下來的決定，就無法恢復。** Flush 的時間點、當下的 buffer size 都沒有被記錄，所以 Replay 時就不能依賴它們，只能用已保存的 Batch Boundary。
+
+文章指出的「外部 side effect 與自己的 state 更新無法成為單一 atomic write」，在本文的對應是：Object Storage 的寫入與 Metadata Store 的更新，是兩個不同的系統。要消除這個縫隙，只有兩條路：讓外部系統加入同一個 transaction，或用冪等補償。本文採用後者，也就是 `WRITING` 狀態搭配 checksum 驗證。
 
 ### 本文屬於哪一種形態
 
